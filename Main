@@ -1,0 +1,283 @@
+import socket
+import math
+import json
+import time
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+# ============================================================
+# Project OMINOUS
+# 2D WiFi CSI body tracker
+# This version AUTO-PINGS the boards (no CMD windows needed)
+# and expects RAW CSI bytes (no 0x4F header).
+# ============================================================
+
+RX1_IP = "XXX.XXX.XXX"
+RX2_IP = "XXX.XXX.XXX"
+RX3_IP = "XXX.XXX.XXX"
+
+ALL_BOARDS  = [RX1_IP, RX2_IP, RX3_IP]
+BOARD_NAMES = {RX1_IP: "RX-1", RX2_IP: "RX-2", RX3_IP: "RX-3"}
+# Change this part to your specs
+ROOM_WIDTH  = 13
+ROOM_HEIGHT = 13
+# all starting from point 0,0 which is the corner next to my closet
+BOARD_POSITIONS = {
+    RX1_IP: (0, 5.5), # window
+    RX2_IP: (13, 10), # desk
+    RX3_IP: (5.9, 0), # dresser
+}
+
+# percent inset so dots never sit on the border (keeps all green dots visible)
+PAD = 8
+
+CALIBRATION_COUNT = 2000   # per board
+
+# smoothing / sensitivity
+SIGNAL_ALPHA   = 0.7
+POSITION_ALPHA = 1.0
+NOISE_SIGMAS   = 4.0
+
+baseline = {ip: None for ip in ALL_BOARDS}
+noise_std = {ip: 0.0  for ip in ALL_BOARDS}
+signals = {ip: None for ip in ALL_BOARDS}
+position = {"x": ROOM_WIDTH / 2, "y": ROOM_HEIGHT / 2}
+path_log = []
+calibration_samples = {ip: [] for ip in ALL_BOARDS}
+calibration_done = False
+
+# ============================================================
+# AUTO-PING: keeps the air busy so boards keep getting CSI.
+# ============================================================
+def auto_ping():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    while True:
+        for ip in ALL_BOARDS:
+            try:
+                s.sendto(b"x", (ip, 9))   # tiny packet, port doesn't matter
+            except Exception:
+                pass
+        time.sleep(0.5)
+
+def get_amplitude(data):
+    amplitudes = []
+    i = 0
+    while i < len(data) - 1:
+        imaginary = data[i]
+        real      = data[i + 1]
+        if imaginary > 127: imaginary -= 256
+        if real > 127:      real      -= 256
+        amplitudes.append(math.sqrt(real**2 + imaginary**2))
+        i += 2
+    if not amplitudes:
+        return 0.0
+    return sum(amplitudes) / len(amplitudes)
+
+def estimate_position():
+    if any(baseline[ip] is None or signals[ip] is None for ip in ALL_BOARDS):
+        return position["x"], position["y"]
+    weights = {}
+    for ip in ALL_BOARDS:
+        z = (baseline[ip] - signals[ip]) / max(noise_std[ip], 1e-6)
+        weights[ip] = max(0.0, z - NOISE_SIGMAS)
+    total = sum(weights.values())
+    if total < 0.5:
+        return position["x"], position["y"]
+    x = sum(BOARD_POSITIONS[ip][0] * weights[ip] for ip in ALL_BOARDS) / total
+    y = sum(BOARD_POSITIONS[ip][1] * weights[ip] for ip in ALL_BOARDS) / total
+    sx = position["x"] * (1 - POSITION_ALPHA) + x * POSITION_ALPHA
+    sy = position["y"] * (1 - POSITION_ALPHA) + y * POSITION_ALPHA
+    return sx, sy
+
+def build_board_html():
+    parts = []
+    for ip in ALL_BOARDS:
+        bx, by = BOARD_POSITIONS[ip]
+        # inset by PAD so a dot at the wall (0 or max) stays fully inside the box
+        left = PAD + (bx / ROOM_WIDTH)  * (100 - 2 * PAD)
+        top  = PAD + (by / ROOM_HEIGHT) * (100 - 2 * PAD)
+        parts.append(
+            '<div class="board" style="left:{l:.1f}%;top:{t:.1f}%"></div>'
+            '<div class="board-label" style="left:{l:.1f}%;top:{t:.1f}%">{n}</div>'
+            .format(l=left, t=top, n=BOARD_NAMES[ip]))
+    return "\n        ".join(parts)
+
+HTML_PAGE = """
+<!DOCTYPE html><html><head><title>OMINOUS</title><style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background:#06060c; color:#fff; font-family:monospace;
+  display:flex; flex-direction:column; align-items:center; padding:20px; min-height:100vh; }
+h1 { color:#fff; letter-spacing:6px; font-size:24px; margin-bottom:4px; }
+.subtitle { color:#fff; font-size:11px; margin-bottom:24px; }
+#room { position:relative; width:500px; height:500px; border:1px solid #1a1a2e;
+  background:#0a0a12; border-radius:4px; overflow:hidden; }
+#you { position:absolute; width:24px; height:24px; background:#ff3355; border-radius:50%;
+  transform:translate(-50%,-50%); box-shadow:0 0 20px #ff3355,0 0 60px #ff335544;
+  transition:left .2s ease, top .2s ease; z-index:10; opacity:0.7; }
+.trail { position:absolute; background:#ff3355; border-radius:50%;
+  transform:translate(-50%,-50%); pointer-events:none; }
+.board { position:absolute; width:20px; height:20px; background:#00ff88; border-radius:4px;
+  transform:translate(-50%,-50%); box-shadow:0 0 16px #00ff88; z-index:5; }
+.board-label { position:absolute; color:#00ff88; font-size:10px; letter-spacing:1px;
+  transform:translate(-50%,12px); white-space:nowrap; text-align:center; z-index:5; }
+#stats { margin-top:16px; display:flex; gap:16px; }
+.stat { text-align:center; background:#0a0a12; border:1px solid #1a1a2e;
+  border-radius:8px; padding:10px 16px; }
+.stat-label { color:#fff; font-size:10px; letter-spacing:1px; }
+.stat-value { color:#fff; font-size:18px; margin-top:4px; }
+#status-bar { margin-top:12px; font-size:12px; color:#ffaa00; letter-spacing:2px; }
+#status-bar.tracking { color:#ff3355; }
+</style></head><body>
+<h1>OMINOUS</h1>
+<div class="subtitle">top-down view - __ROOM__ - 3 rx boards</div>
+<div id="room">
+        __BOARDS__
+        <div id="you"></div>
+</div>
+<div id="stats">
+  <div class="stat"><div class="stat-label">RX-1</div><div class="stat-value" id="sig1">--</div></div>
+  <div class="stat"><div class="stat-label">RX-2</div><div class="stat-value" id="sig2">--</div></div>
+  <div class="stat"><div class="stat-label">RX-3</div><div class="stat-value" id="sig3">--</div></div>
+  <div class="stat"><div class="stat-label">POSITION</div><div class="stat-value" id="pos">--</div></div>
+</div>
+<div id="status-bar">WAITING...</div>
+<script>
+const ROOM_W = __W__, ROOM_H = __H__;
+const PAD = 8;   // must match the Python PAD so the red dot lines up with the boards
+let trail = [];
+setInterval(async function(){
+  try {
+    const r = await fetch('/data'); const d = await r.json();
+    const xp = PAD + (d.x/ROOM_W)*(100-2*PAD), yp = PAD + (d.y/ROOM_H)*(100-2*PAD);
+    const dot = document.getElementById('you');
+    dot.style.left = xp+'%'; dot.style.top = yp+'%';
+    trail.push({x:xp,y:yp}); if (trail.length>40) trail.shift();
+    const room = document.getElementById('room');
+    room.querySelectorAll('.trail').forEach(t=>t.remove());
+    trail.forEach(function(p,i){
+      const t=document.createElement('div'); t.className='trail';
+      t.style.left=p.x+'%'; t.style.top=p.y+'%';
+      t.style.opacity=(i/trail.length)*0.5;
+      const s=(3+(i/trail.length)*4)+'px'; t.style.width=s; t.style.height=s;
+      room.appendChild(t);
+    });
+    document.getElementById('sig1').textContent=d.sig1.toFixed(1);
+    document.getElementById('sig2').textContent=d.sig2.toFixed(1);
+    document.getElementById('sig3').textContent=d.sig3.toFixed(1);
+    document.getElementById('pos').textContent=Math.round(d.x)+','+Math.round(d.y)+'ft';
+    const sb=document.getElementById('status-bar');
+    sb.textContent=d.status.toUpperCase();
+    sb.className=d.status.includes('track')?'tracking':'';
+  } catch(e){}
+}, 100);
+</script></body></html>
+"""
+HTML_PAGE = (HTML_PAGE
+    .replace("__BOARDS__", build_board_html())
+    .replace("__ROOM__", str(ROOM_WIDTH)+"x"+str(ROOM_HEIGHT)+"ft")
+    .replace("__W__", str(ROOM_WIDTH)).replace("__H__", str(ROOM_HEIGHT)))
+
+class OminousServer(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/':
+            self.send_response(200)
+            self.send_header('Content-type','text/html'); self.end_headers()
+            self.wfile.write(HTML_PAGE.encode())
+        elif self.path == '/data':
+            self.send_response(200)
+            self.send_header('Content-type','application/json')
+            self.send_header('Access-Control-Allow-Origin','*'); self.end_headers()
+            status = "tracking you" if calibration_done else "calibrating..."
+            self.wfile.write(json.dumps({
+                "x": position["x"], "y": position["y"],
+                "sig1": signals[RX1_IP] or 0.0,
+                "sig2": signals[RX2_IP] or 0.0,
+                "sig3": signals[RX3_IP] or 0.0,
+                "status": status,
+            }).encode())
+    def log_message(self, *a): pass
+
+def start_web_server():
+    HTTPServer(('0.0.0.0', 8080), OminousServer).serve_forever()
+
+def save_path():
+    while True:
+        time.sleep(5)
+        if path_log:
+            with open("ominous_path.json","w") as f:
+                json.dump(path_log, f, indent=2)
+
+threading.Thread(target=start_web_server, daemon=True).start()
+threading.Thread(target=save_path,        daemon=True).start()
+threading.Thread(target=auto_ping,        daemon=True).start()
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind(('0.0.0.0', 5555))
+
+print("OMINOUS - Starting up...")
+print("Auto-ping is ON (no CMD windows needed)")
+print("1. Flash all 3 boards")
+print("2. LEAVE THE ROOM during calibration")
+print("3. Open http://localhost:8080")
+print("4. Walk in after CALIBRATION DONE\n")
+
+boards_seen  = {}
+packet_count = 0
+start_time   = time.time()
+
+while True:
+    data, address = sock.recvfrom(4096)
+    ip = address[0]
+
+    if ip not in boards_seen:
+        boards_seen[ip] = len(boards_seen) + 1
+        if ip in ALL_BOARDS:
+            print("Connected: " + BOARD_NAMES[ip] + " (" + ip + ")")
+        else:
+            print("Unknown sender " + ip + " (ignored)")
+
+    if ip not in ALL_BOARDS:
+        continue
+
+    amp = get_amplitude(data)
+    if signals[ip] is None:
+        signals[ip] = amp
+    else:
+        signals[ip] = signals[ip] * (1 - SIGNAL_ALPHA) + amp * SIGNAL_ALPHA
+
+    if not calibration_done:
+        calibration_samples[ip].append(signals[ip])
+        if all(len(calibration_samples[b]) >= CALIBRATION_COUNT for b in ALL_BOARDS):
+            for b in ALL_BOARDS:
+                s = calibration_samples[b][50:]
+                m = sum(s) / len(s)
+                v = sum((x - m)**2 for x in s) / len(s)
+                baseline[b]  = m
+                noise_std[b] = math.sqrt(v)
+            calibration_done = True
+            print("\nCalibration done! Walk around.\n")
+            for b in ALL_BOARDS:
+                print("   " + BOARD_NAMES[b] + " baseline " +
+                      str(round(baseline[b],1)) + "  noise " + str(round(noise_std[b],2)))
+            print()
+        else:
+            total = sum(len(calibration_samples[b]) for b in ALL_BOARDS)
+            if total % 60 == 0:
+                print("Calibrating  RX1:" + str(len(calibration_samples[RX1_IP])) +
+                      " RX2:" + str(len(calibration_samples[RX2_IP])) +
+                      " RX3:" + str(len(calibration_samples[RX3_IP])))
+        continue
+
+    x, y = estimate_position()
+    position["x"], position["y"] = x, y
+    path_log.append({"time": time.time(), "x": round(x,2), "y": round(y,2)})
+    if len(path_log) > 10000:
+        path_log.pop(0)
+
+    packet_count += 1
+    if packet_count % 50 == 0:
+        line = "z: "
+        for b in ALL_BOARDS:
+            z = (baseline[b] - signals[b]) / max(noise_std[b], 1e-6)
+            line += BOARD_NAMES[b] + " " + str(round(z, 1)) + "  "
+        print(line)
