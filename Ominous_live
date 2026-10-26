@@ -1,0 +1,318 @@
+import socket
+import json
+import time
+import threading
+from collections import deque, Counter
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import numpy as np
+import joblib
+
+# ================================================================
+# OMINOUS - STEP 3 (live, ML zones)
+# Sticky majority vote (hysteresis) + empty-guard + stale-data check.
+# No motion gate: the vote alone decides, and switching requires a
+# sustained takeover, so brief wrong-prediction bursts can't move
+# the dot while you're standing still.
+# ================================================================
+
+# Board IPs come from environment variables (see ominous_collect.py)
+import os
+def _board_ip(name):
+    ip = os.environ.get(name)
+    if not ip:
+        raise SystemExit("Set the " + name + " environment variable to that board's IP address.")
+    return ip
+
+RX1_IP = _board_ip("OMINOUS_RX1_IP")
+RX2_IP = _board_ip("OMINOUS_RX2_IP")
+RX3_IP = _board_ip("OMINOUS_RX3_IP")
+ALL_BOARDS  = [RX1_IP, RX2_IP, RX3_IP]
+BOARD_NAMES = {RX1_IP: "RX-1", RX2_IP: "RX-2", RX3_IP: "RX-3"}
+
+ROOM_WIDTH  = 13
+ROOM_HEIGHT = 13
+PAD = 8
+
+BOARD_POSITIONS = {
+    RX1_IP: (0, 5.5),    # window
+    RX2_IP: (13, 10),    # desk
+    RX3_IP: (5.9, 0),    # dresser
+}
+
+ZONE_POSITIONS = {
+    "dresser": (5.9, 0),
+    "window":  (0, 5.5),
+    "desk":    (13, 10),
+    "center":  (ROOM_WIDTH / 2, ROOM_HEIGHT / 2),
+}
+
+MODEL_FILE      = "ominous_model.joblib"
+INFERENCE_HZ    = 5      # predictions per second
+SMOOTH_WINDOW   = 8      # vote looks at the last 8 predictions (~1.6s @ 5Hz)
+SWITCH_FRACTION = 0.7    # a new zone needs >= 70% of the window (6 of 8) to take over
+EMPTY_FRACTION  = 0.9    # 'empty' needs ~unanimity (8 of 8) before the dot hides
+STALE_SECONDS   = 2.0    # ignore a board if its last packet is older than this
+PING_PERIOD     = 0.05   # one full ping cycle (~20 pings/sec to each board)
+
+# --- load the trained model ---
+_m      = joblib.load(MODEL_FILE)
+CLF     = _m["clf"]
+SCALER  = _m["scaler"]
+LENGTHS = _m["lengths"]
+ZONES   = _m["zones"]
+
+# --- shared state ---
+latest       = {ip: None for ip in ALL_BOARDS}
+last_seen    = {ip: 0 for ip in ALL_BOARDS}
+recent_preds = deque(maxlen=SMOOTH_WINDOW)
+state = {
+    "zone": "empty", "raw": "--", "conf": 0.0,
+    "x": ROOM_WIDTH / 2, "y": ROOM_HEIGHT / 2,
+    "present": False, "status": "waiting",
+}
+
+def amps_from_packet(data):
+    out = []
+    i = 0
+    while i < len(data) - 1:
+        im = data[i]; re = data[i + 1]
+        if im > 127: im -= 256
+        if re > 127: re -= 256
+        out.append((re * re + im * im) ** 0.5)
+        i += 2
+    return out
+
+def fix(v, n):
+    v = list(v[:n])
+    if len(v) < n:
+        v = v + [0.0] * (n - len(v))
+    return v
+
+def build_features(vecs):
+    f = (fix(vecs[RX1_IP], LENGTHS[0]) +
+         fix(vecs[RX2_IP], LENGTHS[1]) +
+         fix(vecs[RX3_IP], LENGTHS[2]))
+    return np.array([f], dtype=float)
+
+def decide_zone(current):
+    """Sticky vote; 'empty' needs near-unanimity so the dot doesn't vanish."""
+    if not recent_preds:
+        return current
+    counts = Counter(recent_preds)
+    top_zone, top_count = counts.most_common(1)[0]
+    n = len(recent_preds)
+
+    # entering 'empty' (hiding the dot) needs near-unanimous agreement
+    if top_zone == "empty" and current != "empty":
+        if top_count >= EMPTY_FRACTION * n:
+            return "empty"
+        # otherwise consider the best NON-empty zone
+        non_empty = [(z, c) for z, c in counts.most_common() if z != "empty"]
+        if non_empty:
+            z, c = non_empty[0]
+            if z != current and c >= SWITCH_FRACTION * (n - counts.get("empty", 0)):
+                return z
+        return current
+
+    if top_zone == current:
+        return current
+    if top_count >= SWITCH_FRACTION * n:
+        return top_zone
+    return current
+
+# ----------------------- threads -----------------------
+def auto_ping():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    gap = PING_PERIOD / len(ALL_BOARDS)
+    while True:
+        for ip in ALL_BOARDS:
+            try: s.sendto(b"x", (ip, 9))
+            except Exception: pass
+            time.sleep(gap)
+
+def listen():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(('0.0.0.0', 5555))
+    seen = set()
+    while True:
+        data, addr = sock.recvfrom(4096)
+        ip = addr[0]
+        if ip in ALL_BOARDS:
+            if ip not in seen:
+                seen.add(ip)
+                print("Connected: " + BOARD_NAMES[ip] + " (" + ip + ")")
+            a = amps_from_packet(data)
+            if a:
+                latest[ip] = a
+                last_seen[ip] = time.time()
+        elif ip not in seen:
+            seen.add(ip)
+            print("Unknown sender " + ip + " (ignored)")
+
+def infer_loop():
+    period = 1.0 / INFERENCE_HZ
+    ticks = 0
+    while True:
+        time.sleep(period)
+
+        # wait until every board has sent at least one packet
+        if any(latest[ip] is None for ip in ALL_BOARDS):
+            state["status"] = "waiting for boards"
+            continue
+
+        # don't classify on stale CSI
+        now = time.time()
+        if any(now - last_seen[ip] > STALE_SECONDS for ip in ALL_BOARDS):
+            state["status"] = "waiting for boards"
+            continue
+
+        try:
+            X = SCALER.transform(build_features(latest))
+            zone = CLF.predict(X)[0]
+            conf = float(np.max(CLF.predict_proba(X)[0]))
+        except Exception:
+            state["status"] = "infer error"
+            continue
+
+        recent_preds.append(zone)
+        sm = decide_zone(state["zone"])
+
+        state["raw"], state["conf"], state["zone"] = zone, conf, sm
+        if sm == "empty":
+            state["present"] = False
+            state["status"]  = "no one detected"
+        else:
+            state["present"] = True
+            state["status"]  = "tracking: " + sm
+            state["x"], state["y"] = ZONE_POSITIONS.get(
+                sm, (ROOM_WIDTH / 2, ROOM_HEIGHT / 2))
+
+        ticks += 1
+        if ticks % INFERENCE_HZ == 0:   # ~once per second
+            print("raw=%-8s zone=%-8s conf=%3d%%"
+                  % (zone, sm, int(conf * 100)))
+
+# ----------------------- web map -----------------------
+def build_board_html():
+    parts = []
+    for ip in ALL_BOARDS:
+        bx, by = BOARD_POSITIONS[ip]
+        left = PAD + (bx / ROOM_WIDTH)  * (100 - 2 * PAD)
+        top  = PAD + (by / ROOM_HEIGHT) * (100 - 2 * PAD)
+        parts.append(
+            '<div class="board" style="left:{l:.1f}%;top:{t:.1f}%"></div>'
+            '<div class="board-label" style="left:{l:.1f}%;top:{t:.1f}%">{n}</div>'
+            .format(l=left, t=top, n=BOARD_NAMES[ip]))
+    return "\n        ".join(parts)
+
+HTML_PAGE = """
+<!DOCTYPE html><html><head><title>OMINOUS</title><style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background:#06060c; color:#fff; font-family:monospace;
+  display:flex; flex-direction:column; align-items:center; padding:20px; min-height:100vh; }
+h1 { color:#fff; letter-spacing:6px; font-size:24px; margin-bottom:4px; }
+.subtitle { color:#fff; font-size:11px; margin-bottom:24px; }
+#room { position:relative; width:500px; height:500px; border:1px solid #1a1a2e;
+  background:#0a0a12; border-radius:4px; overflow:hidden; }
+#you { position:absolute; width:24px; height:24px; background:#ff3355; border-radius:50%;
+  transform:translate(-50%,-50%); box-shadow:0 0 20px #ff3355,0 0 60px #ff335544;
+  transition:left .25s ease, top .25s ease; z-index:10; opacity:0.85; }
+.trail { position:absolute; background:#ff3355; border-radius:50%;
+  transform:translate(-50%,-50%); pointer-events:none; }
+.board { position:absolute; width:20px; height:20px; background:#00ff88; border-radius:4px;
+  transform:translate(-50%,-50%); box-shadow:0 0 16px #00ff88; z-index:5; }
+.board-label { position:absolute; color:#00ff88; font-size:10px; letter-spacing:1px;
+  transform:translate(-50%,12px); white-space:nowrap; text-align:center; z-index:5; }
+#stats { margin-top:16px; display:flex; gap:12px; }
+.stat { text-align:center; background:#0a0a12; border:1px solid #1a1a2e;
+  border-radius:8px; padding:10px 14px; min-width:80px; }
+.stat-label { color:#888; font-size:10px; letter-spacing:1px; }
+.stat-value { color:#fff; font-size:18px; margin-top:4px; }
+#status-bar { margin-top:12px; font-size:12px; color:#ffaa00; letter-spacing:2px; }
+#status-bar.tracking { color:#ff3355; }
+</style></head><body>
+<h1>OMINOUS</h1>
+<div class="subtitle">zone tracking - __ROOM__ - 3 rx boards</div>
+<div id="room">
+        __BOARDS__
+        <div id="you"></div>
+</div>
+<div id="stats">
+  <div class="stat"><div class="stat-label">ZONE</div><div class="stat-value" id="zone">--</div></div>
+  <div class="stat"><div class="stat-label">RAW</div><div class="stat-value" id="raw">--</div></div>
+  <div class="stat"><div class="stat-label">CONF</div><div class="stat-value" id="conf">--</div></div>
+</div>
+<div id="status-bar">WAITING...</div>
+<script>
+const ROOM_W = __W__, ROOM_H = __H__;
+const PAD = 8;
+let trail = [];
+setInterval(async function(){
+  try {
+    const r = await fetch('/data'); const d = await r.json();
+    const dot = document.getElementById('you');
+    const room = document.getElementById('room');
+    if (d.present) {
+      const xp = PAD + (d.x/ROOM_W)*(100-2*PAD), yp = PAD + (d.y/ROOM_H)*(100-2*PAD);
+      dot.style.display = 'block';
+      dot.style.left = xp+'%'; dot.style.top = yp+'%';
+      trail.push({x:xp,y:yp}); if (trail.length>25) trail.shift();
+    } else {
+      dot.style.display = 'none';
+      trail = [];
+    }
+    room.querySelectorAll('.trail').forEach(t=>t.remove());
+    trail.forEach(function(p,i){
+      const t=document.createElement('div'); t.className='trail';
+      t.style.left=p.x+'%'; t.style.top=p.y+'%';
+      t.style.opacity=(i/trail.length)*0.5;
+      const s=(3+(i/trail.length)*4)+'px'; t.style.width=s; t.style.height=s;
+      room.appendChild(t);
+    });
+    document.getElementById('zone').textContent=(d.zone||'--').toUpperCase();
+    document.getElementById('raw').textContent=(d.raw||'--').toUpperCase();
+    document.getElementById('conf').textContent=Math.round((d.conf||0)*100)+'%';
+    const sb=document.getElementById('status-bar');
+    sb.textContent=(d.status||'').toUpperCase();
+    sb.className=d.present?'tracking':'';
+  } catch(e){}
+}, 100);
+</script></body></html>
+"""
+HTML_PAGE = (HTML_PAGE
+    .replace("__BOARDS__", build_board_html())
+    .replace("__ROOM__", str(ROOM_WIDTH) + "x" + str(ROOM_HEIGHT) + "ft")
+    .replace("__W__", str(ROOM_WIDTH)).replace("__H__", str(ROOM_HEIGHT)))
+
+class OminousServer(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/':
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html'); self.end_headers()
+            self.wfile.write(HTML_PAGE.encode())
+        elif self.path == '/data':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*'); self.end_headers()
+            self.wfile.write(json.dumps(state).encode())
+    def log_message(self, *a): pass
+
+def main():
+    threading.Thread(target=HTTPServer(('0.0.0.0', 8080), OminousServer).serve_forever,
+                     daemon=True).start()
+    threading.Thread(target=auto_ping,  daemon=True).start()
+    threading.Thread(target=listen,     daemon=True).start()
+    threading.Thread(target=infer_loop, daemon=True).start()
+
+    print("OMINOUS - live zone tracking")
+    print("Model:", MODEL_FILE, "| zones:", ZONES)
+    print("Open http://localhost:8080  (boards must be powered + on WiFi)")
+    print("Ctrl+C to stop.\n")
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nstopped.")
+
+if __name__ == "__main__":
+    main()
