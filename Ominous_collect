@@ -1,0 +1,127 @@
+import socket
+import math
+import json
+import time
+import threading
+
+# ============================================================
+# OMINOUS - STEP 1: collect labeled CSI for zone fingerprinting
+# You stand in each zone while this records. Later we train a
+# model on the file it produces (csi_data.jsonl).
+# ============================================================
+
+# Replace these with your boards' IP addresses (shown in the serial monitor at boot)
+RX1_IP = "192.168.x.x"  # RX-1 board IP
+RX2_IP = "192.168.x.x"  # RX-2 board IP
+RX3_IP = "192.168.x.x"  # RX-3 board IP
+ALL_BOARDS = [RX1_IP, RX2_IP, RX3_IP]
+
+# The spots you'll walk between. Edit these names to match your room.
+# Add "empty" and record it with NOBODY in the room - it helps the
+# model know what "no one here" looks like.
+ZONES = ["dresser", "window", "desk", "center", "empty"]
+
+SNAPSHOT_HZ = 10                 # labeled samples saved per second
+OUTPUT_FILE = "csi_data.jsonl"   # everything gets appended here
+
+# --- shared state ---
+latest = {ip: None for ip in ALL_BOARDS}  # newest amp vector per board
+current_zone = None
+recording = False
+samples_this_zone = 0
+
+def amps_from_packet(data):
+    """Turn raw CSI bytes into a list of per-subcarrier amplitudes."""
+    out = []
+    i = 0
+    while i < len(data) - 1:
+        im = data[i]
+        re = data[i + 1]
+        if im > 127: im -= 256
+        if re > 127: re -= 256
+        out.append(math.sqrt(re * re + im * im))
+        i += 2
+    return out
+
+def auto_ping():
+    """Keep the air busy so the boards keep producing CSI."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    while True:
+        for ip in ALL_BOARDS:
+            try: s.sendto(b"x", (ip, 9))
+            except Exception: pass
+        time.sleep(0.01)
+
+def listen():
+    """Keep the most recent amplitude vector from each board."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(('0.0.0.0', 5555))
+    while True:
+        data, addr = sock.recvfrom(4096)
+        ip = addr[0]
+        if ip in ALL_BOARDS:
+            a = amps_from_packet(data)
+            if a:
+                latest[ip] = a
+
+def snapshot(fh):
+    """Every 1/SNAPSHOT_HZ sec, if recording, save one labeled row."""
+    global samples_this_zone
+    period = 1.0 / SNAPSHOT_HZ
+    last_print = 0.0
+    while True:
+        time.sleep(period)
+        if not (recording and current_zone is not None):
+            continue
+        if all(latest[ip] is not None for ip in ALL_BOARDS):
+            row = {
+                "zone": current_zone,
+                "t":    round(time.time(), 3),
+                "b0":   latest[RX1_IP],
+                "b1":   latest[RX2_IP],
+                "b2":   latest[RX3_IP],
+            }
+            fh.write(json.dumps(row) + "\n")
+            fh.flush()
+            samples_this_zone += 1
+        # heartbeat so you can see it working (and spot a dead board)
+        now = time.time()
+        if now - last_print > 2.0:
+            missing = [ip for ip in ALL_BOARDS if latest[ip] is None]
+            if missing:
+                print(" ...waiting on board(s): " + ", ".join(missing) + " (check it's powered / on WiFi)")
+            else:
+                print(" ..." + str(samples_this_zone) + " samples for '" + str(current_zone) + "'")
+            last_print = now
+
+fh = open(OUTPUT_FILE, "a")
+threading.Thread(target=auto_ping, daemon=True).start()
+threading.Thread(target=listen,    daemon=True).start()
+threading.Thread(target=snapshot, args=(fh,), daemon=True).start()
+
+print("OMINOUS - data collection")
+print("Zones:", ", ".join(ZONES))
+print("-" * 50)
+print("Type a zone name + Enter to START recording it.")
+print("Stand in that spot, shift around a little (don't freeze).")
+print("Type 'stop' to pause, then move to the next zone.")
+print("Type 'done' when you've recorded every zone.\n")
+print("Aim for ~2-3 minutes per zone.\n")
+
+while True:
+    cmd = input("> ").strip().lower()
+    if cmd == "done":
+        recording = False
+        print("Saved to " + OUTPUT_FILE + ". Done.")
+        break
+    elif cmd == "stop":
+        recording = False
+        print("   paused - " + str(samples_this_zone) +
+              " samples saved for '" + str(current_zone) + "'")
+    elif cmd in ZONES:
+        current_zone = cmd
+        samples_this_zone = 0
+        recording = True
+        print("   RECORDING '" + cmd + "' - stand there. Type 'stop' when done.")
+    else:
+        print("   unknown. Use one of: " + ", ".join(ZONES) + "   (or stop / done)")
