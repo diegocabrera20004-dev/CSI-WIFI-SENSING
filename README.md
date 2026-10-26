@@ -36,8 +36,6 @@ Configuration:
 Network credentials and IP addresses are intentionally not committed. Copy the example config, then set your own SSID, password, PC IP, and board IPs before flashing or running.
 
 
-Repo layout:
-firmware/            ESP-IDF project (CSI capture + UDP sender)
-ominous_collect.py   labeled data collection
-ominous_train.py     model training + evaluation report
-ominous_live.py      real-time classifier + web map
+Repo layout: firmware/ ESP-IDF project (CSI capture + UDP sender) ominous_collect.py labeled data collection ominous_train.py model training + evaluation report ominous_live.py real-time classifier + web map
+
+Author: Diego - https://www.linkedin.com/in/diegocoding/
