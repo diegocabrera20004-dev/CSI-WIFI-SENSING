@@ -1,0 +1,72 @@
+import json
+import numpy as np
+from collections import Counter
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix
+import joblib
+
+# ============================================================
+# OMINOUS - STEP 2: train a zone classifier from csi_data.jsonl
+# Run after you've collected data. It prints how well it learned
+# and saves a model file the live step (step 3) will load.
+# ============================================================
+
+DATA_FILE  = "csi_data.jsonl"
+MODEL_FILE = "ominous_model.joblib"
+
+# --- 1) load every labeled sample ---
+rows = []
+with open(DATA_FILE) as f:
+    for line in f:
+        line = line.strip()
+        if line:
+            rows.append(json.loads(line))
+print("Loaded " + str(len(rows)) + " samples")
+print("Per zone:", dict(Counter(r["zone"] for r in rows)))
+
+# --- 2) pick a fixed subcarrier length per board (the most common one) ---
+def vec_len(r):
+    return (len(r["b0"]), len(r["b1"]), len(r["b2"]))
+target = Counter(vec_len(r) for r in rows).most_common(1)[0][0]
+print("Using subcarrier lengths (b0,b1,b2):", target)
+
+def fix(v, n):
+    v = v[:n]
+    if len(v) < n:
+        v = v + [0.0] * (n - len(v))
+    return v
+
+# --- 3) build feature matrix X and labels y ---
+X, y = [], []
+for r in rows:
+    feat = fix(r["b0"], target[0]) + fix(r["b1"], target[1]) + fix(r["b2"], target[2])
+    X.append(feat)
+    y.append(r["zone"])
+X = np.array(X, dtype=float)
+y = np.array(y)
+
+# --- 4) scale features (kNN needs this) ---
+scaler = StandardScaler()
+Xs = scaler.fit_transform(X)
+
+# --- 5) split, train ---
+Xtr, Xte, ytr, yte = train_test_split(
+    Xs, y, test_size=0.25, random_state=0, stratify=y)
+clf = KNeighborsClassifier(n_neighbors=15, weights="distance")
+clf.fit(Xtr, ytr)
+
+# --- 6) report how well it learned ---
+pred = clf.predict(Xte)
+labels = sorted(set(y))
+print("\n=== how well it learned (on held-out data) ===")
+print(classification_report(yte, pred, digits=2))
+print("Confusion matrix (rows = true, cols = predicted):")
+print("order:", labels)
+print(confusion_matrix(yte, pred, labels=labels))
+
+# --- 7) save everything the live step needs ---
+joblib.dump({"clf": clf, "scaler": scaler, "lengths": target, "zones": labels}, MODEL_FILE)
+
+print("\nSaved model to " + MODEL_FILE)
